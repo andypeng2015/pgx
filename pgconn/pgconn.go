@@ -678,6 +678,10 @@ func (pgConn *PgConn) receiveMessage() (pgproto3.BackendMessage, error) {
 	case *pgproto3.ErrorResponse:
 		err := ErrorResponseToPgError(msg)
 		if pgConn.config.OnPgError != nil && !pgConn.config.OnPgError(pgConn, err) {
+			// The callback may have already closed the connection.
+			if pgConn.status == connStatusClosed {
+				return nil, err
+			}
 			pgConn.status = connStatusClosed
 			pgConn.conn.Close() // Ignore error as the connection is already broken and there is already an error to return.
 			close(pgConn.cleanupDone)

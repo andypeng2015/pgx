@@ -4590,6 +4590,65 @@ func TestConnOnPgError(t *testing.T) {
 	assert.True(t, pgConn.IsClosed())
 }
 
+func TestConnOnPgErrorClosesConnection(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		clientConn.Close()
+		serverConn.Close()
+	})
+	require.NoError(t, serverConn.SetDeadline(time.Now().Add(5*time.Second)))
+
+	steps := pgmock.AcceptUnauthenticatedConnRequestSteps()
+	steps = append(steps,
+		pgmock.ExpectAnyMessage(&pgproto3.Query{}),
+		pgmock.SendMessage(&pgproto3.ErrorResponse{
+			Severity: "FATAL",
+			Code:     "57P01",
+			Message:  "terminating connection due to administrator command",
+		}),
+		pgmock.ExpectAnyMessage(&pgproto3.Terminate{}),
+	)
+	script := &pgmock.Script{Steps: steps}
+	serverErrChan := make(chan error, 1)
+	go func() {
+		serverErrChan <- script.Run(pgproto3.NewBackend(serverConn, serverConn))
+	}()
+
+	config, err := pgconn.ParseConfig("host=127.0.0.1 sslmode=disable")
+	require.NoError(t, err)
+	config.DialFunc = func(context.Context, string, string) (net.Conn, error) {
+		return clientConn, nil
+	}
+	callbackCalled := false
+	config.OnPgError = func(c *pgconn.PgConn, pgErr *pgconn.PgError) bool {
+		callbackCalled = true
+		// Close synchronously, then request closure through the callback's return value too.
+		require.NoError(t, c.Close(ctx))
+		return false
+	}
+
+	conn, err := pgconn.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "select 1").ReadAll()
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "FATAL", pgErr.Severity)
+	require.Equal(t, "57P01", pgErr.Code)
+	require.True(t, callbackCalled)
+	require.True(t, conn.IsClosed())
+	select {
+	case <-conn.CleanupDone():
+	default:
+		t.Fatal("connection cleanup did not complete")
+	}
+	require.NoError(t, <-serverErrChan)
+}
+
 func TestConnCustomData(t *testing.T) {
 	t.Parallel()
 
